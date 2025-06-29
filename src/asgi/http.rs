@@ -6,7 +6,10 @@ use tokio::sync::{Notify, mpsc};
 use super::callbacks::{call_http, call_ws};
 use crate::{
     callbacks::ArcCBScheduler,
-    http::{HTTPRequest, HTTPResponse, HV_SERVER, empty_body, response_500},
+    http::{
+        HTTPRequest, HTTPResponse, HV_SERVER, empty_body, extract_auth_header, response_401, response_500,
+        validate_basic_auth,
+    },
     runtime::RuntimeRef,
     ws::{UpgradeData, is_upgrade_request as is_ws_upgrade, upgrade_intent as ws_upgrade},
 };
@@ -50,6 +53,42 @@ macro_rules! handle_request {
             req: HTTPRequest,
             scheme: &str,
         ) -> HTTPResponse {
+            let (parts, body) = req.into_parts();
+            handle_http_response!(
+                $handler,
+                rt,
+                disconnect_guard,
+                callback,
+                server_addr,
+                client_addr,
+                parts,
+                scheme,
+                body
+            )
+        }
+    };
+}
+
+macro_rules! handle_request_with_auth {
+    ($func_name:ident, $handler:expr, $auth_username:expr, $auth_password:expr, $auth_realm:expr) => {
+        #[inline]
+        pub(crate) async fn $func_name(
+            rt: RuntimeRef,
+            disconnect_guard: Arc<Notify>,
+            callback: ArcCBScheduler,
+            server_addr: SocketAddr,
+            client_addr: SocketAddr,
+            req: HTTPRequest,
+            scheme: &str,
+        ) -> HTTPResponse {
+            // Check authentication if credentials are provided
+            if let (Some(username), Some(password)) = ($auth_username, $auth_password) {
+                let auth_header = extract_auth_header(&req);
+                if !validate_basic_auth(auth_header, username, password) {
+                    return response_401($auth_realm);
+                }
+            }
+
             let (parts, body) = req.into_parts();
             handle_http_response!(
                 $handler,
@@ -168,5 +207,275 @@ macro_rules! handle_request_with_ws {
     };
 }
 
+macro_rules! handle_request_with_ws_and_auth {
+    ($func_name:ident, $handler_req:expr, $handler_ws:expr, $auth_username:expr, $auth_password:expr, $auth_realm:expr) => {
+        #[inline]
+        pub(crate) async fn $func_name(
+            rt: RuntimeRef,
+            disconnect_guard: Arc<Notify>,
+            callback: ArcCBScheduler,
+            server_addr: SocketAddr,
+            client_addr: SocketAddr,
+            mut req: HTTPRequest,
+            scheme: &str,
+        ) -> HTTPResponse {
+            if is_ws_upgrade(&req) {
+                // Check authentication for WebSocket upgrade requests
+                if let (Some(username), Some(password)) = ($auth_username, $auth_password) {
+                    let auth_header = extract_auth_header(&req);
+                    if !validate_basic_auth(auth_header, username, password) {
+                        return response_401($auth_realm);
+                    }
+                }
+
+                return match ws_upgrade(&mut req, None) {
+                    Ok((res, ws)) => {
+                        let (restx, mut resrx) = mpsc::channel(1);
+                        let (parts, _) = req.into_parts();
+                        let scheme: Box<str> = match scheme {
+                            SCHEME_HTTPS => SCHEME_WSS,
+                            _ => SCHEME_WS,
+                        }
+                        .into();
+
+                        tokio::task::spawn(async move {
+                            let tx_ref = restx.clone();
+
+                            match $handler_ws(
+                                callback,
+                                rt,
+                                server_addr,
+                                client_addr,
+                                &scheme,
+                                ws,
+                                parts,
+                                UpgradeData::new(res, restx),
+                            )
+                            .await
+                            {
+                                Ok(mut detached) => {
+                                    match detached.consumed {
+                                        false => {
+                                            let _ = tx_ref
+                                                .send(
+                                                    ResponseBuilder::new()
+                                                        .status(StatusCode::FORBIDDEN)
+                                                        .header(HK_SERVER, HV_SERVER)
+                                                        .body(empty_body())
+                                                        .unwrap(),
+                                                )
+                                                .await;
+                                        }
+                                        true => {
+                                            detached.close().await;
+                                        }
+                                    };
+                                }
+                                _ => {
+                                    log::error!("ASGI protocol failure");
+                                    let _ = tx_ref.send(response_500()).await;
+                                }
+                            }
+                        });
+
+                        match resrx.recv().await {
+                            Some(res) => {
+                                resrx.close();
+                                res
+                            }
+                            _ => response_500(),
+                        }
+                    }
+                    Err(err) => {
+                        log::info!("Websocket handshake failed with {:?}", err);
+                        return ResponseBuilder::new()
+                            .status(StatusCode::BAD_REQUEST)
+                            .header(HK_SERVER, HV_SERVER)
+                            .body(
+                                http_body_util::Full::new(format!("{}", err).into())
+                                    .map_err(|e| match e {})
+                                    .boxed(),
+                            )
+                            .unwrap();
+                    }
+                };
+            }
+
+            // Check authentication for regular HTTP requests
+            if let (Some(username), Some(password)) = ($auth_username, $auth_password) {
+                let auth_header = extract_auth_header(&req);
+                if !validate_basic_auth(auth_header, username, password) {
+                    return response_401($auth_realm);
+                }
+            }
+
+            let (parts, body) = req.into_parts();
+            handle_http_response!(
+                $handler_req,
+                rt,
+                disconnect_guard,
+                callback,
+                server_addr,
+                client_addr,
+                parts,
+                scheme,
+                body
+            )
+        }
+    };
+}
+
+// Default handlers without authentication
 handle_request!(handle, call_http);
 handle_request_with_ws!(handle_ws, call_http, call_ws);
+
+// Export authentication-aware handlers (these will be used when auth is enabled)
+pub(crate) async fn handle_with_auth(
+    rt: RuntimeRef,
+    disconnect_guard: Arc<Notify>,
+    callback: ArcCBScheduler,
+    server_addr: SocketAddr,
+    client_addr: SocketAddr,
+    req: HTTPRequest,
+    scheme: &str,
+    auth_username: Option<&str>,
+    auth_password: Option<&str>,
+    auth_realm: &str,
+) -> HTTPResponse {
+    // Check authentication if credentials are provided
+    if let (Some(username), Some(password)) = (auth_username, auth_password) {
+        let auth_header = extract_auth_header(&req);
+        if !validate_basic_auth(auth_header, username, password) {
+            return response_401(auth_realm);
+        }
+    }
+
+    let (parts, body) = req.into_parts();
+    handle_http_response!(
+        call_http,
+        rt,
+        disconnect_guard,
+        callback,
+        server_addr,
+        client_addr,
+        parts,
+        scheme,
+        body
+    )
+}
+
+pub(crate) async fn handle_ws_with_auth(
+    rt: RuntimeRef,
+    disconnect_guard: Arc<Notify>,
+    callback: ArcCBScheduler,
+    server_addr: SocketAddr,
+    client_addr: SocketAddr,
+    mut req: HTTPRequest,
+    scheme: &str,
+    auth_username: Option<&str>,
+    auth_password: Option<&str>,
+    auth_realm: &str,
+) -> HTTPResponse {
+    if is_ws_upgrade(&req) {
+        // Check authentication for WebSocket upgrade requests
+        if let (Some(username), Some(password)) = (auth_username, auth_password) {
+            let auth_header = extract_auth_header(&req);
+            if !validate_basic_auth(auth_header, username, password) {
+                return response_401(auth_realm);
+            }
+        }
+
+        return match ws_upgrade(&mut req, None) {
+            Ok((res, ws)) => {
+                let (restx, mut resrx) = mpsc::channel(1);
+                let (parts, _) = req.into_parts();
+                let scheme: Box<str> = match scheme {
+                    SCHEME_HTTPS => SCHEME_WSS,
+                    _ => SCHEME_WS,
+                }
+                .into();
+
+                tokio::task::spawn(async move {
+                    let tx_ref = restx.clone();
+
+                    match call_ws(
+                        callback,
+                        rt,
+                        server_addr,
+                        client_addr,
+                        &scheme,
+                        ws,
+                        parts,
+                        UpgradeData::new(res, restx),
+                    )
+                    .await
+                    {
+                        Ok(mut detached) => {
+                            match detached.consumed {
+                                false => {
+                                    let _ = tx_ref
+                                        .send(
+                                            ResponseBuilder::new()
+                                                .status(StatusCode::FORBIDDEN)
+                                                .header(HK_SERVER, HV_SERVER)
+                                                .body(empty_body())
+                                                .unwrap(),
+                                        )
+                                        .await;
+                                }
+                                true => {
+                                    detached.close().await;
+                                }
+                            };
+                        }
+                        _ => {
+                            log::error!("ASGI protocol failure");
+                            let _ = tx_ref.send(response_500()).await;
+                        }
+                    }
+                });
+
+                match resrx.recv().await {
+                    Some(res) => {
+                        resrx.close();
+                        res
+                    }
+                    _ => response_500(),
+                }
+            }
+            Err(err) => {
+                log::info!("Websocket handshake failed with {:?}", err);
+                return ResponseBuilder::new()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header(HK_SERVER, HV_SERVER)
+                    .body(
+                        http_body_util::Full::new(format!("{}", err).into())
+                            .map_err(|e| match e {})
+                            .boxed(),
+                    )
+                    .unwrap();
+            }
+        };
+    }
+
+    // Check authentication for regular HTTP requests
+    if let (Some(username), Some(password)) = (auth_username, auth_password) {
+        let auth_header = extract_auth_header(&req);
+        if !validate_basic_auth(auth_header, username, password) {
+            return response_401(auth_realm);
+        }
+    }
+
+    let (parts, body) = req.into_parts();
+    handle_http_response!(
+        call_http,
+        rt,
+        disconnect_guard,
+        callback,
+        server_addr,
+        client_addr,
+        parts,
+        scheme,
+        body
+    )
+}

@@ -217,6 +217,30 @@ def option(*param_decls: str, cls: Optional[Type[click.Option]] = None, **attrs:
     default=False,
     help='Verify clients SSL certificates',
 )
+@option(
+    '--auth-type',
+    type=click.Choice(['none', 'basic', 'htpasswd']),
+    default='none',
+    help='Type of authentication to use',
+)
+@option(
+    '--auth-username',
+    help='Username for basic authentication',
+)
+@option(
+    '--auth-password',
+    help='Password for basic authentication',
+)
+@option(
+    '--auth-realm',
+    default='Granian',
+    help='Authentication realm (shown in browser prompt)',
+)
+@option(
+    '--auth-htpasswd-file',
+    type=click.Path(exists=True, file_okay=True, dir_okay=False, readable=True, path_type=pathlib.Path),
+    help='Path to .htpasswd file for htpasswd authentication',
+)
 @option('--url-path-prefix', help='URL path prefix the app is mounted on')
 @option(
     '--respawn-failed-workers/--no-respawn-failed-workers',
@@ -367,6 +391,11 @@ def cli(
     ssl_ca: Optional[pathlib.Path],
     ssl_crl: Optional[List[pathlib.Path]],
     ssl_client_verify: bool,
+    auth_type: str,
+    auth_username: Optional[str],
+    auth_password: Optional[str],
+    auth_realm: str,
+    auth_htpasswd_file: Optional[pathlib.Path],
     url_path_prefix: Optional[str],
     respawn_failed_workers: bool,
     respawn_interval: float,
@@ -396,6 +425,29 @@ def cli(
             except Exception:
                 print('Unable to parse provided logging config.')
                 raise click.exceptions.Exit(1)
+
+    # Apply authentication middleware if authentication is enabled
+    if auth_type and auth_type.lower() != 'none':
+        from .auth_middleware import add_auth_to_app
+
+        # Load the target application
+        from .server.common import load_target
+
+        target_app = load_target(app, wd=working_dir, factory=factory)
+
+        # Wrap with authentication middleware
+        target_app = add_auth_to_app(
+            target_app,
+            interface=interface.value,
+            auth_type=auth_type,
+            username=auth_username,
+            password=auth_password,
+            realm=auth_realm,
+            htpasswd_file=str(auth_htpasswd_file) if auth_htpasswd_file else None,
+        )
+
+        # Update the app string to use the wrapped application
+        app = target_app
 
     server = Server(
         app,

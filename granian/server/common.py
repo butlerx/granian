@@ -104,6 +104,11 @@ class AbstractServer(Generic[WT]):
         ssl_ca: Optional[Path] = None,
         ssl_crl: Optional[List[Path]] = None,
         ssl_client_verify: bool = False,
+        auth_type: str = 'none',
+        auth_username: Optional[str] = None,
+        auth_password: Optional[str] = None,
+        auth_realm: str = 'Granian',
+        auth_htpasswd_file: Optional[Path] = None,
         url_path_prefix: Optional[str] = None,
         respawn_failed_workers: bool = False,
         respawn_interval: float = 3.5,
@@ -187,6 +192,14 @@ class AbstractServer(Generic[WT]):
         configure_logging(self.log_level, self.log_config, self.log_enabled)
 
         self.build_ssl_context(ssl_cert, ssl_key, ssl_key_password, ssl_ca, ssl_crl or [], ssl_client_verify)
+
+        # Initialize authentication
+        self.auth_type = auth_type
+        self.auth_username = auth_username
+        self.auth_password = auth_password
+        self.auth_realm = auth_realm
+        self.auth_htpasswd_file = str(auth_htpasswd_file.resolve()) if auth_htpasswd_file else None
+
         self._ssp = None
         self._shd = None
         self._sfd = None

@@ -104,6 +104,9 @@ class MPServer(AbstractServer[WorkerProcess]):
         log_access_fmt: Optional[str],
         ssl_ctx: SSLCtx,
         scope_opts: Dict[str, Any],
+        auth_username: Optional[str],
+        auth_password: Optional[str],
+        auth_realm: str,
     ):
         from granian._signals import set_loop_signals
 
@@ -124,6 +127,9 @@ class MPServer(AbstractServer[WorkerProcess]):
             websockets,
             static_path,
             *ssl_ctx,
+            auth_username,
+            auth_password,
+            auth_realm,
         )
         serve = getattr(worker, {RuntimeModes.mt: 'serve_mtr', RuntimeModes.st: 'serve_str'}[runtime_mode])
         scheduler = _new_cbscheduler(loop, wcallback, impl_asyncio=task_impl == TaskImpl.asyncio)

@@ -10,7 +10,10 @@ use super::{
 };
 use crate::{
     callbacks::ArcCBScheduler,
-    http::{HTTPRequest, HTTPResponse, HV_SERVER, empty_body, response_500},
+    http::{
+        HTTPRequest, HTTPResponse, HV_SERVER, empty_body, extract_auth_header, response_401, response_500,
+        validate_basic_auth,
+    },
     runtime::RuntimeRef,
     ws::{UpgradeData, is_upgrade_request as is_ws_upgrade, upgrade_intent as ws_upgrade},
 };
@@ -74,14 +77,19 @@ macro_rules! handle_request_with_ws {
             scheme: &str,
         ) -> HTTPResponse {
             if is_ws_upgrade(&req) {
-                match ws_upgrade(&mut req, None) {
+                return match ws_upgrade(&mut req, None) {
                     Ok((res, ws)) => {
-                        let (parts, _) = req.into_parts();
-                        let scope = build_scope!(WebsocketScope, server_addr, client_addr, parts, scheme);
                         let (restx, mut resrx) = mpsc::channel(1);
+                        let (parts, _) = req.into_parts();
+                        let scheme: Box<str> = match scheme {
+                            "https" => "wss",
+                            _ => "ws",
+                        }
+                        .into();
 
                         tokio::task::spawn(async move {
                             let tx_ref = restx.clone();
+                            let scope = build_scope!(WebsocketScope, server_addr, client_addr, parts, &scheme);
 
                             match $handler_ws(callback, rt, ws, UpgradeData::new(res, restx), scope).await {
                                 Ok((status, consumed, stream)) => match (consumed, stream) {
@@ -108,7 +116,7 @@ macro_rules! handle_request_with_ws {
                             }
                         });
 
-                        return match resrx.recv().await {
+                        match resrx.recv().await {
                             Some(res) => {
                                 resrx.close();
                                 res
@@ -128,7 +136,7 @@ macro_rules! handle_request_with_ws {
                             )
                             .unwrap();
                     }
-                }
+                };
             }
 
             let (parts, body) = req.into_parts();
@@ -138,5 +146,128 @@ macro_rules! handle_request_with_ws {
     };
 }
 
+// Default handlers without authentication
 handle_request!(handle, call_http);
 handle_request_with_ws!(handle_ws, call_http, call_ws);
+
+// Export authentication-aware handlers (these will be used when auth is enabled)
+pub(crate) async fn handle_with_auth(
+    rt: RuntimeRef,
+    disconnect_guard: Arc<Notify>,
+    callback: ArcCBScheduler,
+    server_addr: SocketAddr,
+    client_addr: SocketAddr,
+    req: HTTPRequest,
+    scheme: &str,
+    auth_username: Option<&str>,
+    auth_password: Option<&str>,
+    auth_realm: &str,
+) -> HTTPResponse {
+    // Check authentication if credentials are provided
+    if let (Some(username), Some(password)) = (auth_username, auth_password) {
+        let auth_header = extract_auth_header(&req);
+        if !validate_basic_auth(auth_header, username, password) {
+            return response_401(auth_realm);
+        }
+    }
+
+    let (parts, body) = req.into_parts();
+    let scope = build_scope!(HTTPScope, server_addr, client_addr, parts, scheme);
+    handle_http_response!(call_http, rt, disconnect_guard, callback, body, scope)
+}
+
+pub(crate) async fn handle_ws_with_auth(
+    rt: RuntimeRef,
+    disconnect_guard: Arc<Notify>,
+    callback: ArcCBScheduler,
+    server_addr: SocketAddr,
+    client_addr: SocketAddr,
+    mut req: HTTPRequest,
+    scheme: &str,
+    auth_username: Option<&str>,
+    auth_password: Option<&str>,
+    auth_realm: &str,
+) -> HTTPResponse {
+    if is_ws_upgrade(&req) {
+        // Check authentication for WebSocket upgrade requests
+        if let (Some(username), Some(password)) = (auth_username, auth_password) {
+            let auth_header = extract_auth_header(&req);
+            if !validate_basic_auth(auth_header, username, password) {
+                return response_401(auth_realm);
+            }
+        }
+
+        return match ws_upgrade(&mut req, None) {
+            Ok((res, ws)) => {
+                let (restx, mut resrx) = mpsc::channel(1);
+                let (parts, _) = req.into_parts();
+                let scheme: Box<str> = match scheme {
+                    "https" => "wss",
+                    _ => "ws",
+                }
+                .into();
+
+                tokio::task::spawn(async move {
+                    let tx_ref = restx.clone();
+                    let scope = build_scope!(WebsocketScope, server_addr, client_addr, parts, &scheme);
+
+                    match call_ws(callback, rt, ws, UpgradeData::new(res, restx), scope).await {
+                        Ok((status, consumed, stream)) => match (consumed, stream) {
+                            (false, _) => {
+                                let _ = tx_ref
+                                    .send(
+                                        ResponseBuilder::new()
+                                            .status(status as u16)
+                                            .header(HK_SERVER, HV_SERVER)
+                                            .body(empty_body())
+                                            .unwrap(),
+                                    )
+                                    .await;
+                            }
+                            (true, Some(mut stream)) => {
+                                let _ = stream.close().await;
+                            }
+                            _ => {}
+                        },
+                        _ => {
+                            log::error!("RSGI protocol failure");
+                            let _ = tx_ref.send(response_500()).await;
+                        }
+                    }
+                });
+
+                match resrx.recv().await {
+                    Some(res) => {
+                        resrx.close();
+                        res
+                    }
+                    _ => response_500(),
+                }
+            }
+            Err(err) => {
+                log::info!("Websocket handshake failed with {:?}", err);
+                return ResponseBuilder::new()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header(HK_SERVER, HV_SERVER)
+                    .body(
+                        http_body_util::Full::new(format!("{}", err).into())
+                            .map_err(|e| match e {})
+                            .boxed(),
+                    )
+                    .unwrap();
+            }
+        };
+    }
+
+    // Check authentication for regular HTTP requests
+    if let (Some(username), Some(password)) = (auth_username, auth_password) {
+        let auth_header = extract_auth_header(&req);
+        if !validate_basic_auth(auth_header, username, password) {
+            return response_401(auth_realm);
+        }
+    }
+
+    let (parts, body) = req.into_parts();
+    let scope = build_scope!(HTTPScope, server_addr, client_addr, parts, scheme);
+    handle_http_response!(call_http, rt, disconnect_guard, callback, body, scope)
+}
